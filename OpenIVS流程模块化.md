@@ -17,43 +17,51 @@
 | 类型 | 含义 | 典型用途 |
 |------|------|----------|
 | signal | 触发信号 | Trigger -> Camera |
-| image_chan | BGR 图像（Mat） | Camera -> 推理 -> 存图 |
-| result_chan | 结构化结果（JObject） | 推理 -> 匹配 -> 存储 |
-| template | 模版对象 | Load -> Match |
+| image | BGR 图像（Mat） | Camera -> 推理 -> 存图 |
+| result | 结构化结果（JObject） | 推理 -> 匹配 -> 存储 |
+| template | 模版对象（JObject） | Load -> Match |
 | bool | 布尔值 | ok/ng 判定传递 |
 | string | 字符串 | product_type、position 等 |
 | int | 整数 | sequence 等 |
 
-端口分为两种模式：
-- **单连接端口**（默认）：一个输入端口只能接收一条连线
-- **收集端口（collector）**：可接收多条同类型连线，运行时收齐所有输入后才执行（用于 merge 等聚合节点）
+## 3. 连接规则与行为
 
-## 3. 连接规则
+### 连接约束
+1. 连线只能从输出端口到输入端口，编辑器仅允许相同 data_type 的端口互连
+2. 单连接输入端口再次连线时，自动断开旧连线
+3. 图内禁止环路（拓扑排序时检测）
 
-1. 只能从输出端口连到输入端口，且两端 data_type 必须相同
-2. 单连接输入端口只允许一条入边；收集端口允许多条
-3. 一个输出端口可连接多个下游输入端口（扇出）
-4. `required = true` 的输入端口必须有连接，否则校验失败
-5. 图内禁止环路
-6. Trigger 节点必须唯一，且作为图的入口
-7. 至少存在一个 output/* 节点
+### 缺失输入时的运行行为
+- 端口未连接时，节点仍可执行，按以下规则处理：
+  - `image`：跳过该节点，不产生输出
+  - `result`：使用空 JObject
+  - `bool`：使用默认值（true/false 由模块定义）
+  - `string`：使用空字符串
+  - `template`：跳过匹配，ok_raw 输出 true
+- 节点的所有关键输入均缺失时，整个节点跳过，下游按缺失处理
+
+### 编辑器提示
+- 推荐连接未接时，编辑器用虚线/灰色标记提示用户，但不阻止保存和运行
+
 
 ## 4. 主图模块库
 
 ### 4.1 trigger（触发）
 
-图的唯一入口，产生启动信号。
+图的唯一入口，产生启动信号。支持配置多个触发源，任一触发源激活即产生信号；流程运行中忽略新触发。
 
 | | 端口名 | 类型 |
 |---|--------|------|
 | 出 | signal | signal |
 
 属性：
-- `proto`：plc / software
-- PLC 模式：`signal_address`、`poll_ms`、`edge`（rising/falling）
-- 软件模式：`interval_ms`
+- `sources[]`：触发源列表，可包含以下类型：
+  - PLC 边沿触发：`signal_address`、`poll_ms`、`edge`（rising/falling）
+  - 手动触发：始终启用，由 UI 拍照按钮触发
 
 约束：全图只能有一个 trigger 节点。
+如果是OR语义，在同时触发情况下，需要加锁/去重逻辑等
+
 
 ### 4.2 camera（相机采集）
 
@@ -62,16 +70,12 @@
 | | 端口名 | 类型 |
 |---|--------|------|
 | 入 | signal | signal |
-| 出 | image_chan | image_chan |
-| 出 | result_chan | result_chan |
-| 出 | position | string |
+| 出 | image | image |
+
 
 属性：
 - `mode`：Real / Test
-- `device_config`：设备配置（Real 模式）
-- `image`：测试图片路径或目录（Test 模式）
-- `loop`：是否循环（Test 模式）
-- `interval_ms`：采集间隔（Test 模式）
+- `device_config`：设备配置
 - `position`：摄像头位置标识
 - `rotation`：旋转角度（0/90/180/270）
 - `trigger_mode`：SoftTrigger / HardTrigger
@@ -86,14 +90,24 @@
 
 | | 端口名 | 类型 |
 |---|--------|------|
-| 入 | signal | signal |
 | 出 | value | string |
 | 出 | success | bool |
 
 属性：
-- `source`：plc_register / manual / constant
-- `address`、`count`、`encoding`（PLC 模式）
-- `default_value`（手动/常量模式）
+- `input_mode`：选择输入方式
+  - `plc`：从PLC读取
+  - `manual`：手动输入
+  - `constant`：固定值
+
+PLC配置（仅 input_mode=plc 时显示）：
+- `address`：PLC寄存器地址
+- `count`：读取的字节/字数量
+- `encoding`：字符编码（UTF-8/ASCII/GB2312等）
+
+值设置（仅 input_mode=manual/constant 时显示）：
+- `product_type`：字符串值
+- `allow_edit`：是否允许UI编辑（仅manual模式，控制是否可修改）
+
 
 ### 4.4 inference/subgraph（推理子图）
 
@@ -101,17 +115,15 @@
 
 | | 端口名 | 类型 |
 |---|--------|------|
-| 入 | image_chan | image_chan |
-| 入 | result_chan | result_chan（可选） |
-| 入 | position | string（可选） |
-| 出 | image_chan | image_chan |
-| 出 | result_chan | result_chan |
+| 入 | image | image |
+| 出 | image | image |
+| 出 | result | result |
 | 出 | ok_raw | bool |
 
 属性：
 - `subgraph_path`：推理子图 JSON 路径
 
-执行时加载子图 JSON，委托给已有的 `GraphExecutor` 执行，将 image_chan/result_chan 传入子图、收回结果。所有后处理与 OK/NG 判定（缺陷尺寸过滤、缝隙阈值、模版匹配等）均在子图内部完成，主图只接收最终的 ok_raw 和 result_chan。子图模块定义见 `流程图.md`。
+执行时加载子图 JSON，委托给已有的 `GraphExecutor` 执行，将 image/result 传入子图、收回结果。所有后处理与 OK/NG 判定（缺陷尺寸过滤、缝隙阈值、模版匹配等）均在子图内部完成，主图只接收最终的 ok_raw 和 result。子图模块定义见 `流程图.md`。
 
 ### 4.5 template/load（模版加载）
 
@@ -120,7 +132,6 @@
 | | 端口名 | 类型 |
 |---|--------|------|
 | 入 | product_type | string |
-| 入 | position | string |
 | 出 | template | template |
 | 出 | has_template | bool |
 
@@ -135,16 +146,14 @@
 | | 端口名 | 类型 |
 |---|--------|------|
 | 入 | template | template |
-| 入 | result_chan | result_chan |
-| 出 | result_chan | result_chan |
+| 入 | result | result |
+| 出 | result | result |
 | 出 | ok_raw | bool |
 
 属性：
 - `position_tolerance_x`、`position_tolerance_y`
 - `size_tolerance`
-- `min_confidence_threshold`
-- `text_similarity_threshold`
-- `min_match_score`
+- `min_confidence`
 
 匹配规则详见 `功能.md` 5.7 节。
 
@@ -154,13 +163,12 @@
 
 | | 端口名 | 类型 |
 |---|--------|------|
-| 入 | image_chan | image_chan |
-| 入 | result_chan | result_chan |
+| 入 | image | image |
+| 入 | result | result |
 | 入 | product_type | string |
-| 入 | position | string |
 | 入 | should_create | bool（可选，默认 true） |
-| 出 | template_id | string |
-| 出 | success | bool |
+| 出 | template | template |
+| 出 | ok_raw | bool |
 
 属性：
 - `save_image`：是否保存参考图
@@ -180,48 +188,36 @@
 | | 端口名 | 类型 | 模式 |
 |---|--------|------|------|
 | 入 | ok_raw | bool | collector |
-| 入 | result_chan | result_chan | collector |
-| 入 | position | string | collector |
+| 入 | result | result | collector |
 | 出 | overall_ok | bool | - |
-| 出 | position_statuses | result_chan | - |
+| 出 | position_statuses | result | - |
 | 出 | first_ng_reason | string | - |
 
 属性：`any_ng_is_ng`（默认 true）
 
 collector 端口：接收多条连线，执行引擎根据入边数量判断"收齐"条件，全部到齐后才执行此节点。用户每连接一路结果，merge 就自动多等一路。
 
-### 4.9 decision/force_ok（空跑判定）
-
-空跑模式下将写回结果强制为 OK。
-
-| | 端口名 | 类型 |
-|---|--------|------|
-| 入 | ok_in | bool |
-| 出 | ok_send | bool |
-
-属性：`dry_run`（是否空跑，引用全局设置）
-
-规则：dry_run = true -> ok_send = true；否则 ok_send = ok_in。
-
-### 4.10 output/*（输出模块）
+### 4.9 output/*（输出模块）
 
 **output/modbus_write_block**
 
 | | 端口名 | 类型 |
 |---|--------|------|
-| 入 | ok_send | bool |
+| 入 | overall_ok | bool |
 | 出 | success | bool |
 
-属性：`start_address`、`count`、`ok_value`、`ng_value`、`ack_value`、`timeout_ms`
+属性：`start_address`、`count`、`ok_value`、`ng_value`、`ack_value`、`timeout_ms`、`dry_run`
+
+当 dry_run=true 时，引擎在所有 Camera 取图完成后立即执行此节点（发送 OK），不等待 overall_ok 输入就绪；
+当 dry_run=false 时，正常等待 overall_ok 后按真实结果发送。
 
 **output/save_image**
 
 | | 端口名 | 类型 |
 |---|--------|------|
-| 入 | image_chan | image_chan |
+| 入 | image | image |
 | 入 | overall_ok | bool |
 | 入 | product_type | string |
-| 入 | position | string |
 | 出 | image_path | string |
 
 属性：`save_root`、`save_ok_images`、`save_ng_images`、`ok_format`、`ng_format`、`jpg_quality`
@@ -230,10 +226,9 @@ collector 端口：接收多条连线，执行引擎根据入边数量判断"收
 
 | | 端口名 | 类型 |
 |---|--------|------|
-| 入 | result_chan | result_chan |
+| 入 | result | result |
 | 入 | overall_ok | bool |
 | 入 | product_type | string |
-| 入 | position | string |
 | 出 | json_path | string |
 
 属性：`save_root`、`save_ok_results`、`save_ng_results`
@@ -244,7 +239,7 @@ collector 端口：接收多条连线，执行引擎根据入边数量判断"收
 |---|--------|------|
 | 入 | overall_ok | bool |
 | 入 | product_type | string |
-| 入 | position_statuses | result_chan |
+| 入 | position_statuses | result |
 | 入 | first_ng_reason | string |
 | 出 | csv_path | string |
 
@@ -254,8 +249,8 @@ collector 端口：接收多条连线，执行引擎根据入边数量判断"收
 
 | | 端口名 | 类型 |
 |---|--------|------|
-| 入 | image_chan | image_chan |
-| 入 | result_chan | result_chan |
+| 入 | image | image |
+| 入 | result | result |
 | 出 | vis_path | string |
 
 属性：`suffix`、`jpg_quality`
@@ -277,6 +272,8 @@ collector 端口：接收多条连线，执行引擎根据入边数量判断"收
 - **推理并行**：多个 inference/subgraph 节点可并行执行
 - **merge 等待**：collector 端口的节点需等待所有入边数据到齐
 - **output 并行**：多个 output 节点可并行执行
+- **position 自动获取**：position 不作为端口传递，执行引擎沿图拓扑向上追溯到 Camera 节点，自动获取其 `position` 属性。需要 position 的模块（save_image、save_json、template/load、merge 等）均由引擎注入，无需手动连线
+- **空跑模式提前发送**：当 output/modbus 的 `dry_run=true` 时，引擎在所有 Camera 取图完成后立即执行该节点（发送 OK），不等待推理和汇总完成；推理、匹配、存图等后续流程仍完整执行
 
 ### 5.3 流水线效果
 Camera 串行 + 推理并行 + 数据驱动，自然形成流水线：
@@ -307,7 +304,7 @@ Output:                                                                         
 ```
                                                  +-> template/load --template-> template/match --ok_raw->+
 trigger(PLC) --signal-> camera(A) --image/result-> inference/subgraph --result-+                          |
-             --signal-> camera(B) --image/result-> inference/subgraph --ok_raw-------------------------->+-> merge --overall_ok-> decision --ok_send-> output/modbus
+             --signal-> camera(B) --image/result-> inference/subgraph --ok_raw-------------------------->+-> merge --overall_ok-> output/modbus
              --signal-> camera(C) --image/result-> inference/subgraph --ok_raw-------------------------->+         |
 input/data --product_type-> template/load                                                                          +-> output/save_image
                                                                                                                    +-> output/save_json
@@ -316,10 +313,10 @@ input/data --product_type-> template/load                                       
 
 - Trigger 的 signal 扇出到 3 个 Camera
 - 每路 Camera -> inference/subgraph，子图内部完成推理、后处理和 OK/NG 判定
-- A 路需要模版匹配：inference/subgraph 输出 result_chan -> template/match -> ok_raw
+- A 路需要模版匹配：inference/subgraph 输出 result -> template/match -> ok_raw
 - B/C 路不需要模版匹配：直接使用 inference/subgraph 输出的 ok_raw
 - 所有 ok_raw 汇入 merge_positions 的 collector 端口
-- merge 后接 decision 和多个 output
+- merge 的 overall_ok 直接传入 output/modbus，空跑模式由 modbus 节点的 dry_run 属性控制（见 5.2 调度约束）
 
 用户可以自由调整：增减相机数量、决定哪些位置需要模版匹配、增减 output 节点。所有后处理在推理子图内部完成，主图只负责串联采集、推理、汇总、输出。
 
@@ -331,16 +328,16 @@ input/data --product_type-> template/load                                       
 input/data --product_type--+-> template/load --has_template-> NOT --should_create->+
                            |   |                                                    |
                            |   +--template-> template/match --ok_raw-> merge        |
-                           |                 ^ result_chan                           v
-                           +-> template/create <-- image_chan <-- inference/subgraph <-- camera(A)
-                                ^ position        ^ result_chan
-                                +-- camera(A)     +-- inference/subgraph
+                           |                 ^ result                           v
+                           +-> template/create <-- image <-- inference/subgraph <-- camera(A)
+                                               ^ result
+                                               +-- inference/subgraph
 ```
 
 执行流程：
 1. input/data 获取 product_type，camera(A) 采集图像
-2. inference/subgraph 完成推理，输出 result_chan 和 image_chan
-3. template/load 按 product_type + position 查找模版
+2. inference/subgraph 完成推理，输出 result 和 image
+3. template/load 按 product_type + position（引擎自动注入）查找模版
 4. 若 has_template=true：template/match 执行匹配，ok_raw 传入 merge
 5. 若 has_template=false：NOT 输出 true，template/create 从推理结果创建模版
 6. 后续 RunOnce 中 template/load 能加载到刚创建的模版，自动进入匹配流程
